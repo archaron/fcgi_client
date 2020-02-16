@@ -7,11 +7,13 @@ package fcgiclient
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
+	"math"
 	"mime/multipart"
 	"net"
 	"net/http"
@@ -24,6 +26,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"go.uber.org/atomic"
 )
 
 const FCGI_LISTENSOCK_FILENO uint8 = 0
@@ -128,85 +132,78 @@ type FCGIClient struct {
 	h         header
 	buf       bytes.Buffer
 	keepAlive bool
-	reqId     uint16
+	reqId     *atomic.Int32
 }
 
-// Connects to the fcgi responder at the specified network address.
+// DialContext connects to the fcgi responder at the specified network address.
 // See func net.Dial for a description of the network and address parameters.
-func Dial(network, address string) (fcgi *FCGIClient, err error) {
-	var conn net.Conn
+func DialContext(ctx context.Context, network, address string) (fcgi *FCGIClient, err error) {
+	var (
+		conn net.Conn
+		dial net.Dialer
+	)
 
-	conn, err = net.Dial(network, address)
-	if err != nil {
+	if conn, err = dial.DialContext(ctx, network, address);err != nil {
 		return
 	}
 
 	fcgi = &FCGIClient{
 		rwc:       conn,
-		keepAlive: false,
-		reqId:     1,
+		reqId:     atomic.NewInt32(1),
 	}
 
 	return
+}
+// Connects to the fcgi responder at the specified network address.
+// See func net.Dial for a description of the network and address parameters.
+func Dial(network, address string) (*FCGIClient, error) {
+	return DialContext(context.Background(), network, address)
 }
 
 // Connects to the fcgi responder at the specified network address with timeout
 // See func net.DialTimeout for a description of the network, address and timeout parameters.
-func DialTimeout(network, address string, timeout time.Duration) (fcgi *FCGIClient, err error) {
-
-	var conn net.Conn
-
-	conn, err = net.DialTimeout(network, address, timeout)
-	if err != nil {
-		return
-	}
-
-	fcgi = &FCGIClient{
-		rwc:       conn,
-		keepAlive: false,
-		reqId:     1,
-	}
-
-	return
+func DialTimeout(network, address string, timeout time.Duration) (*FCGIClient,  error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return DialContext(ctx, network, address)
 }
 
 // Close fcgi connnection
-func (this *FCGIClient) Close() {
-	this.rwc.Close()
-}
+func (c *FCGIClient) Close() error { return c.rwc.Close() }
 
-func (this *FCGIClient) writeRecord(recType uint8, content []byte) (err error) {
-	this.mutex.Lock()
-	defer this.mutex.Unlock()
-	this.buf.Reset()
-	this.h.init(recType, this.reqId, len(content))
-	if err := binary.Write(&this.buf, binary.BigEndian, this.h); err != nil {
+func (c *FCGIClient) writeRecord(id uint16, recType uint8, content []byte) (err error) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	c.buf.Reset()
+
+	c.h.init(recType, id, len(content))
+	if err := binary.Write(&c.buf, binary.BigEndian, c.h); err != nil {
 		return err
 	}
-	if _, err := this.buf.Write(content); err != nil {
+	if _, err := c.buf.Write(content); err != nil {
 		return err
 	}
-	if _, err := this.buf.Write(pad[:this.h.PaddingLength]); err != nil {
+	if _, err := c.buf.Write(pad[:c.h.PaddingLength]); err != nil {
 		return err
 	}
-	_, err = this.rwc.Write(this.buf.Bytes())
+	_, err = c.rwc.Write(c.buf.Bytes())
 	return err
 }
 
-func (this *FCGIClient) writeBeginRequest(role uint16, flags uint8) error {
+func (c *FCGIClient) writeBeginRequest(id, role uint16, flags uint8) error {
 	b := [8]byte{byte(role >> 8), byte(role), flags}
-	return this.writeRecord(FCGI_BEGIN_REQUEST, b[:])
+	return c.writeRecord(id, FCGI_BEGIN_REQUEST, b[:])
 }
 
-func (this *FCGIClient) writeEndRequest(appStatus int, protocolStatus uint8) error {
+func (c *FCGIClient) writeEndRequest(id uint16, appStatus int, protocolStatus uint8) error {
 	b := make([]byte, 8)
 	binary.BigEndian.PutUint32(b, uint32(appStatus))
 	b[4] = protocolStatus
-	return this.writeRecord(FCGI_END_REQUEST, b)
+	return c.writeRecord(id, FCGI_END_REQUEST, b)
 }
 
-func (this *FCGIClient) writePairs(recType uint8, pairs map[string]string) error {
-	w := newWriter(this, recType)
+func (c *FCGIClient) writePairs(id uint16, recType uint8, pairs map[string]string) error {
+	w := newWriter(id, c, recType)
 	b := make([]byte, 8)
 	nn := 0
 	for k, v := range pairs {
@@ -234,31 +231,7 @@ func (this *FCGIClient) writePairs(recType uint8, pairs map[string]string) error
 			return err
 		}
 	}
-	w.Close()
-	return nil
-}
-
-func readSize(s []byte) (uint32, int) {
-	if len(s) == 0 {
-		return 0, 0
-	}
-	size, n := uint32(s[0]), 1
-	if size&(1<<7) != 0 {
-		if len(s) < 4 {
-			return 0, 0
-		}
-		n = 4
-		size = binary.BigEndian.Uint32(s)
-		size &^= 1 << 31
-	}
-	return size, n
-}
-
-func readString(s []byte, size uint32) string {
-	if size > uint32(len(s)) {
-		return ""
-	}
-	return string(s[:size])
+	return w.Close()
 }
 
 func encodeSize(b []byte, size uint32) int {
@@ -280,14 +253,15 @@ type bufWriter struct {
 
 func (w *bufWriter) Close() error {
 	if err := w.Writer.Flush(); err != nil {
-		w.closer.Close()
+		_ = w.closer.Close()
+
 		return err
 	}
 	return w.closer.Close()
 }
 
-func newWriter(c *FCGIClient, recType uint8) *bufWriter {
-	s := &streamWriter{c: c, recType: recType}
+func newWriter(id uint16, c *FCGIClient, recType uint8) *bufWriter {
+	s := &streamWriter{id: id, c: c, recType: recType}
 	w := bufio.NewWriterSize(s, maxWrite)
 	return &bufWriter{s, w}
 }
@@ -296,6 +270,7 @@ func newWriter(c *FCGIClient, recType uint8) *bufWriter {
 // It only writes maxWrite bytes at a time.
 type streamWriter struct {
 	c       *FCGIClient
+	id      uint16
 	recType uint8
 }
 
@@ -306,7 +281,7 @@ func (w *streamWriter) Write(p []byte) (int, error) {
 		if n > maxWrite {
 			n = maxWrite
 		}
-		if err := w.c.writeRecord(w.recType, p[:n]); err != nil {
+		if err := w.c.writeRecord(w.id, w.recType, p[:n]); err != nil {
 			return nn, err
 		}
 		nn += n
@@ -317,7 +292,7 @@ func (w *streamWriter) Write(p []byte) (int, error) {
 
 func (w *streamWriter) Close() error {
 	// send empty record to close the stream
-	return w.c.writeRecord(w.recType, nil)
+	return w.c.writeRecord(w.id, w.recType, nil)
 }
 
 type streamReader struct {
@@ -347,26 +322,111 @@ func (w *streamReader) Read(p []byte) (n int, err error) {
 	return
 }
 
+func (c *FCGIClient) Listen(ctx context.Context) {
+	done := ctx.Done()
+
+	for {
+		select {
+		case <-done:
+			return
+		default:
+			// read connection data
+		}
+
+		r := &streamReader{c: c}
+
+		rb := bufio.NewReader(r)
+		tp := textproto.NewReader(rb)
+		resp := new(http.Response)
+		// Parse the first line of the response.
+		line, err := tp.ReadLine()
+		if err != nil {
+			if err == io.EOF {
+				err = io.ErrUnexpectedEOF
+			}
+
+			// cb(resp, err)
+
+			continue
+		}
+
+		if i := strings.IndexByte(line, ' '); i == -1 {
+			err = &badStringError{"malformed HTTP response", line}
+		} else {
+			resp.Proto = line[:i]
+			resp.Status = strings.TrimLeft(line[i+1:], " ")
+		}
+
+		statusCode := resp.Status
+		if i := strings.IndexByte(resp.Status, ' '); i != -1 {
+			statusCode = resp.Status[:i]
+		}
+		if len(statusCode) != 3 {
+			err = &badStringError{"malformed HTTP status code", statusCode}
+		}
+		resp.StatusCode, err = strconv.Atoi(statusCode)
+		if err != nil || resp.StatusCode < 0 {
+			err = &badStringError{"malformed HTTP status code", statusCode}
+		}
+		var ok bool
+		if resp.ProtoMajor, resp.ProtoMinor, ok = http.ParseHTTPVersion(resp.Proto); !ok {
+			err = &badStringError{"malformed HTTP version", resp.Proto}
+		}
+		// Parse the response headers.
+		mimeHeader, err := tp.ReadMIMEHeader()
+		if err != nil {
+			if err == io.EOF {
+				err = io.ErrUnexpectedEOF
+			}
+
+			// cb(resp, err)
+
+			continue
+		}
+
+		resp.Header = http.Header(mimeHeader)
+		// TODO: fixTransferEncoding ?
+		resp.TransferEncoding = resp.Header["Transfer-Encoding"]
+		resp.ContentLength, _ = strconv.ParseInt(resp.Header.Get("Content-Length"), 10, 64)
+
+		if chunked(resp.TransferEncoding) {
+			resp.Body = ioutil.NopCloser(httputil.NewChunkedReader(rb))
+		} else {
+			resp.Body = ioutil.NopCloser(rb)
+		}
+
+		// cb(resp, err)
+	}
+}
+
 // Do made the request and returns a io.Reader that translates the data read
 // from fcgi responder out of fcgi packet before returning it.
-func (this *FCGIClient) Do(p map[string]string, req io.Reader) (r io.Reader, err error) {
-	err = this.writeBeginRequest(uint16(FCGI_RESPONDER), 0)
+func (c *FCGIClient) Do(p map[string]string, req io.Reader) (r io.Reader, err error) {
+	c.mutex.Lock()
+	id := c.reqId.Inc()
+	if id >= math.MaxInt16 {
+		id = 1
+		c.reqId.Store(id)
+	}
+	c.mutex.Unlock()
+
+	err = c.writeBeginRequest(uint16(id), uint16(FCGI_RESPONDER), 0)
 	if err != nil {
 		return
 	}
 
-	err = this.writePairs(FCGI_PARAMS, p)
+	err = c.writePairs(uint16(id), FCGI_PARAMS, p)
 	if err != nil {
 		return
 	}
 
-	body := newWriter(this, FCGI_STDIN)
+	body := newWriter(uint16(id), c, FCGI_STDIN)
 	if req != nil {
 		io.Copy(body, req)
 	}
 	body.Close()
 
-	r = &streamReader{c: this}
+	r = &streamReader{c: c}
 	return
 }
 
@@ -379,9 +439,9 @@ func (e *badStringError) Error() string { return fmt.Sprintf("%s %q", e.what, e.
 
 // Request returns a HTTP Response with Header and Body
 // from fcgi responder
-func (this *FCGIClient) Request(p map[string]string, req io.Reader) (resp *http.Response, err error) {
+func (c *FCGIClient) Request(p map[string]string, req io.Reader) (resp *http.Response, err error) {
 
-	r, err := this.Do(p, req)
+	r, err := c.Do(p, req)
 	if err != nil {
 		return
 	}
@@ -440,17 +500,17 @@ func (this *FCGIClient) Request(p map[string]string, req io.Reader) (resp *http.
 }
 
 // Get issues a GET request to the fcgi responder.
-func (this *FCGIClient) Get(p map[string]string) (resp *http.Response, err error) {
+func (c *FCGIClient) Get(p map[string]string) (resp *http.Response, err error) {
 
 	p["REQUEST_METHOD"] = "GET"
 	p["CONTENT_LENGTH"] = "0"
 
-	return this.Request(p, nil)
+	return c.Request(p, nil)
 }
 
 // Get issues a Post request to the fcgi responder. with request body
 // in the format that bodyType specified
-func (this *FCGIClient) Post(p map[string]string, bodyType string, body io.Reader, l int) (resp *http.Response, err error) {
+func (c *FCGIClient) Post(p map[string]string, bodyType string, body io.Reader, l int) (resp *http.Response, err error) {
 
 	if len(p["REQUEST_METHOD"]) == 0 || p["REQUEST_METHOD"] == "GET" {
 		p["REQUEST_METHOD"] = "POST"
@@ -462,20 +522,20 @@ func (this *FCGIClient) Post(p map[string]string, bodyType string, body io.Reade
 		p["CONTENT_TYPE"] = "application/x-www-form-urlencoded"
 	}
 
-	return this.Request(p, body)
+	return c.Request(p, body)
 }
 
 // PostForm issues a POST to the fcgi responder, with form
 // as a string key to a list values (url.Values)
-func (this *FCGIClient) PostForm(p map[string]string, data url.Values) (resp *http.Response, err error) {
+func (c *FCGIClient) PostForm(p map[string]string, data url.Values) (resp *http.Response, err error) {
 	body := bytes.NewReader([]byte(data.Encode()))
-	return this.Post(p, "application/x-www-form-urlencoded", body, body.Len())
+	return c.Post(p, "application/x-www-form-urlencoded", body, body.Len())
 }
 
 // PostFile issues a POST to the fcgi responder in multipart(RFC 2046) standard,
 // with form as a string key to a list values (url.Values),
 // and/or with file as a string key to a list file path.
-func (this *FCGIClient) PostFile(p map[string]string, data url.Values, file map[string]string) (resp *http.Response, err error) {
+func (c *FCGIClient) PostFile(p map[string]string, data url.Values, file map[string]string) (resp *http.Response, err error) {
 	buf := &bytes.Buffer{}
 	writer := multipart.NewWriter(buf)
 	bodyType := writer.FormDataContentType()
@@ -508,7 +568,7 @@ func (this *FCGIClient) PostFile(p map[string]string, data url.Values, file map[
 		return
 	}
 
-	return this.Post(p, bodyType, buf, buf.Len())
+	return c.Post(p, bodyType, buf, buf.Len())
 }
 
 // Checks whether chunked is part of the encodings stack
